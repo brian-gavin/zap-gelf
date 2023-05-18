@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -45,6 +46,12 @@ type (
 		apply(conf *optionConf) error
 	}
 
+	BufferConf struct {
+		SizeInChunks  int           // Default is MaxChunkCount / 2
+		FlushInterval time.Duration // Default is the zapcore.BufferedWriteSyncer.FlushInterval default
+		Clock         zapcore.Clock // Default is the zapcore.BufferedWriteSyncer.Clock default
+	}
+
 	// coreConf core.
 	optionConf struct {
 		addr             string
@@ -56,6 +63,7 @@ type (
 		writeSyncers     []zapcore.WriteSyncer
 		compressionType  int
 		compressionLevel int
+		bufferConf       *BufferConf
 	}
 
 	// optionFunc wraps a func so it satisfies the Option interface.
@@ -90,6 +98,9 @@ var (
 
 	// ErrUnknownCompressionType triggered when passed invalid compression type.
 	ErrUnknownCompressionType = errors.New("unknown compression type")
+
+	// ErrBufferTooLarge triggered when passed a BufferConf.SizeInChunks that is too large
+	ErrBufferTooLarge = errors.New("buffer size too large")
 
 	// chunkedMagicBytes chunked message magic bytes.
 	// See http://docs.graylog.org/en/2.4/pages/gelf.html.
@@ -147,6 +158,16 @@ func NewCore(options ...Option) (_ zapcore.Core, err error) {
 	if len(conf.writeSyncers) > 0 {
 		var writers = append([]zapcore.WriteSyncer{w}, conf.writeSyncers...)
 		ws = zapcore.NewMultiWriteSyncer(writers...)
+	}
+
+	if bConf := conf.bufferConf; bConf != nil {
+		bws := &zapcore.BufferedWriteSyncer{
+			WS:            ws,
+			Size:          w.chunkDataSize*bConf.SizeInChunks - 1,
+			FlushInterval: bConf.FlushInterval,
+			Clock:         bConf.Clock,
+		}
+		ws = bws
 	}
 
 	var core = zapcore.NewCore(
@@ -363,6 +384,19 @@ func CompressionLevel(value int) Option {
 	})
 }
 
+func UseBuffering(value BufferConf) Option {
+	return optionFunc(func(conf *optionConf) error {
+		if value.SizeInChunks > MaxChunkCount {
+			return ErrBufferTooLarge
+		}
+		if value.SizeInChunks == 0 {
+			value.SizeInChunks = MaxChunkCount / 2
+		}
+		conf.bufferConf = &value
+		return nil
+	})
+}
+
 // Write implements io.Writer.
 func (w *writer) Write(buf []byte) (n int, err error) {
 	var (
@@ -518,7 +552,7 @@ func (w *writer) chunkCount(b []byte) int {
 // writeChunked send message by chunks.
 func (w *writer) writeChunked(count int, cBytes []byte) (n int, err error) {
 	if count > MaxChunkCount {
-		return 0, fmt.Errorf("need %d chunks but shold be later or equal to %d", count, MaxChunkCount)
+		return 0, fmt.Errorf("need %d chunks but should be less than or equal to %d", count, MaxChunkCount)
 	}
 
 	var (
